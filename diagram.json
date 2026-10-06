@@ -10,10 +10,11 @@
   "connections": [
     [ "esp:GND.1", "rfid:GND", "black", [ "v0" ] ],
     [ "esp:3V3", "rfid:3.3V", "red", [ "v0" ] ],
-    [ "esp:14", "rfid:SCK", "orange", [ "v0" ] ],
-    [ "esp:26", "rfid:MISO", "yellow", [ "v0" ] ],
-    [ "esp:13", "rfid:MOSI", "green", [ "v0" ] ],
-    [ "esp:27", "rfid:SDA", "blue", [ "v0" ] ]
+    [ "esp:18", "rfid:SCK", "orange", [ "v0" ] ],
+    [ "esp:19", "rfid:MISO", "yellow", [ "v0" ] ],
+    [ "esp:23", "rfid:MOSI", "green", [ "v0" ] ],
+    [ "esp:5", "rfid:SDA", "blue", [ "v0" ] ],
+    [ "esp:22", "rfid:RST", "gray", [ "v0" ] ],
     
     [ "esp:GND.2", "relay:GND", "black", [ "v0" ] ],
     [ "esp:5V", "relay:VCC", "red", [ "v0" ] ],

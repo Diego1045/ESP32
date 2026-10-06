@@ -127,7 +127,10 @@ static esp_err_t rc522_picc_receive(const rc522_handle_t rc522, const rc522_picc
         return RC522_ERR_PCD_FIFO_EMPTY;
     }
 
-    RC522_CHECK(fifo_level > out_result->bytes.length);
+    if (fifo_level > out_result->bytes.length) {
+        RC522_LOGD("fifo trunc %u -> %u", fifo_level, out_result->bytes.length);
+        fifo_level = out_result->bytes.length;
+    }
 
     rc522_picc_transaction_result_t result = {
         .bytes = { 
@@ -160,6 +163,8 @@ static esp_err_t rc522_picc_receive(const rc522_handle_t rc522, const rc522_picc
         RC522_LOGD("not full byte received, valid_bits=%d", result.valid_bits);
     }
 
+    memcpy(out_result, &result, sizeof(result));
+
     if (context->error_reg & RC522_PCD_COLL_ERR_BIT) {
         return RC522_ERR_COLLISION;
     }
@@ -182,8 +187,6 @@ static esp_err_t rc522_picc_receive(const rc522_handle_t rc522, const rc522_picc
         }
     }
 
-    memcpy(out_result, &result, sizeof(result));
-
     return ESP_OK;
 }
 
@@ -203,7 +206,10 @@ esp_err_t rc522_picc_transceive(const rc522_handle_t rc522, const rc522_picc_tra
     RC522_RETURN_ON_ERROR_SILENTLY(rc522_picc_send(rc522, &transaction_clone, &context));
 
     if (out_result) {
-        RC522_RETURN_ON_ERROR(rc522_picc_receive(rc522, &context, out_result));
+        esp_err_t rx = rc522_picc_receive(rc522, &context, out_result);
+        if (rx != ESP_OK) {
+            return rx;
+        }
     }
 
     return ESP_OK;
@@ -243,17 +249,44 @@ static esp_err_t rc522_picc_reqa_or_wupa(const rc522_handle_t rc522, uint8_t pic
     };
 
     esp_err_t ret = rc522_picc_transceive(rc522, &transaction, &transaction_result);
+    bool had_collision = (ret == RC522_ERR_COLLISION);
+
+    if (had_collision) {
+        uint8_t fifo_level = 0;
+        if (rc522_pcd_read(rc522, RC522_PCD_FIFO_LEVEL_REG, &fifo_level) == ESP_OK && fifo_level >= 2
+            && fifo_level <= sizeof(buffer)) {
+            transaction_result.bytes.length = fifo_level;
+            if (rc522_pcd_fifo_read(rc522, &transaction_result.bytes) == ESP_OK) {
+                ret = ESP_OK;
+            }
+        }
+    }
+
+    if (had_collision && ret == ESP_OK && transaction_result.bytes.length >= 2) {
+        /* Una tarjeta en el campo suele marcar colisión en REQA/WUPA; el ATQA en FIFO sigue siendo usable. */
+    }
+
+    if (ret == RC522_ERR_COLLISION && transaction_result.bytes.length < 2) {
+        /* Tarjeta presente pero ATQA incompleto: SELECT/anticollision obtiene el UID. */
+        memset(out_atqa, 0, sizeof(*out_atqa));
+        return ESP_OK;
+    }
 
     if (ret != ESP_OK) {
         // Timeouts are expected if no PICC are in the field, log other errors
-        if (ret != RC522_ERR_RX_TIMER_TIMEOUT && ret != RC522_ERR_RX_TIMEOUT) {
+        if (ret != RC522_ERR_RX_TIMER_TIMEOUT && ret != RC522_ERR_RX_TIMEOUT
+            && ret != RC522_ERR_COLLISION) {
             RC522_LOGD("non-timeout error: %04" RC522_X, ret);
         }
 
         return ret;
     }
 
-    if (transaction_result.bytes.length != 2 || transaction_result.valid_bits != 0) {
+    if (transaction_result.bytes.length < 2) {
+        return RC522_ERR_INVALID_ATQA;
+    }
+
+    if (!had_collision && transaction_result.valid_bits != 0) {
         return RC522_ERR_INVALID_ATQA;
     }
 

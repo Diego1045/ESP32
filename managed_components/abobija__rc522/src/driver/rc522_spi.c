@@ -1,4 +1,6 @@
 #include <string.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 #include "rc522_helpers_internal.h"
 #include "rc522_types_internal.h"
 #include "rc522_driver_internal.h"
@@ -10,6 +12,8 @@ typedef struct
 {
     gpio_num_t cs_io_num;
 } rc522_spi_meta_t;
+
+static SemaphoreHandle_t s_spi_lock;
 
 static void rc522_spi_transaction_pre_cb(spi_transaction_t *trans);
 
@@ -55,14 +59,17 @@ static esp_err_t rc522_spi_install(const rc522_driver_handle_t driver)
         conf->dev_config.queue_size = 7;
     }
 
-    if (conf->dev_config.flags == 0) {
-        conf->dev_config.flags = SPI_DEVICE_HALFDUPLEX;
-    }
-
-    conf->dev_config.command_bits = 1;
-    conf->dev_config.address_bits = 6;
-    conf->dev_config.dummy_bits = 1;
+    /* Full-duplex, una trama por acceso: el half-duplex del ESP32 corrompe el FIFO
+     * (CRC/SAK) y a veces devuelve 0x0102 (bus lock) al partir la lectura. */
+    conf->dev_config.flags = 0;
+    conf->dev_config.command_bits = 0;
+    conf->dev_config.address_bits = 0;
+    conf->dev_config.dummy_bits = 0;
     // }}
+
+    if (s_spi_lock == NULL) {
+        s_spi_lock = xSemaphoreCreateMutex();
+    }
 
     // ESP32 SPI bus has limitation of 3 CS lines, so we need to use
     // software control for CS line in order to use more devices.
@@ -101,22 +108,37 @@ exit:
     return ret;
 }
 
+static esp_err_t rc522_spi_xfer(const rc522_driver_handle_t driver, const uint8_t *tx, uint8_t *rx, size_t len)
+{
+    return spi_device_polling_transmit((spi_device_handle_t)(driver->device),
+        &(spi_transaction_t) {
+            .length = 8 * len,
+            .tx_buffer = tx,
+            .rx_buffer = rx,
+            .user = driver,
+        });
+}
+
 static esp_err_t rc522_spi_send(const rc522_driver_handle_t driver, uint8_t address, const rc522_bytes_t *bytes)
 {
     RC522_CHECK(driver == NULL);
     RC522_CHECK(driver->device == NULL);
     RC522_CHECK_BYTES(bytes);
 
-    esp_err_t ret = spi_device_polling_transmit((spi_device_handle_t)(driver->device),
-        &(spi_transaction_t) {
-            .cmd = RC522_SPI_WRITE,
-            .addr = address,
-            .length = 8 * bytes->length,
-            .tx_buffer = bytes->ptr,
-            .user = driver,
-        });
-
-    return ret;
+    /* Un byte por trama CS: en este ESP32 la ráfaga solo deja el primer byte en el FIFO. */
+    const uint8_t hdr = (uint8_t)((address << 1) & 0x7E);
+    if (s_spi_lock != NULL && xSemaphoreTake(s_spi_lock, pdMS_TO_TICKS(200)) != pdTRUE) {
+        return ESP_ERR_TIMEOUT;
+    }
+    esp_err_t err = ESP_OK;
+    for (size_t i = 0; i < bytes->length && err == ESP_OK; i++) {
+        uint8_t tx[2] = {hdr, bytes->ptr[i]};
+        err = rc522_spi_xfer(driver, tx, NULL, 2);
+    }
+    if (s_spi_lock != NULL) {
+        xSemaphoreGive(s_spi_lock);
+    }
+    return err;
 }
 
 static esp_err_t rc522_spi_receive(const rc522_driver_handle_t driver, uint8_t address, rc522_bytes_t *bytes)
@@ -125,23 +147,21 @@ static esp_err_t rc522_spi_receive(const rc522_driver_handle_t driver, uint8_t a
     RC522_CHECK(driver->device == NULL);
     RC522_CHECK_BYTES(bytes);
 
-    // TODO: Do transactions on higher level
-    // RC522_RETURN_ON_ERROR(spi_device_acquire_bus((spi_device_handle_t)(driver->device), portMAX_DELAY));
-
-    for (uint8_t i = 0; i < bytes->length; i++) {
-        RC522_RETURN_ON_ERROR(spi_device_polling_transmit((spi_device_handle_t)(driver->device),
-            &(spi_transaction_t) {
-                .cmd = RC522_SPI_READ,
-                .addr = address,
-                .rxlength = 8,
-                .rx_buffer = (bytes->ptr + i),
-                .user = driver,
-            }));
+    const uint8_t hdr = (uint8_t)(((address << 1) & 0x7E) | 0x80);
+    if (s_spi_lock != NULL && xSemaphoreTake(s_spi_lock, pdMS_TO_TICKS(200)) != pdTRUE) {
+        return ESP_ERR_TIMEOUT;
     }
-
-    // spi_device_release_bus((spi_device_handle_t)(driver->device));
-
-    return ESP_OK;
+    esp_err_t err = ESP_OK;
+    for (size_t i = 0; i < bytes->length && err == ESP_OK; i++) {
+        uint8_t tx[2] = {hdr, 0x00};
+        uint8_t rx[2] = {0};
+        err = rc522_spi_xfer(driver, tx, rx, 2);
+        bytes->ptr[i] = rx[1];
+    }
+    if (s_spi_lock != NULL) {
+        xSemaphoreGive(s_spi_lock);
+    }
+    return err;
 }
 
 static esp_err_t rc522_spi_reset(const rc522_driver_handle_t driver)
