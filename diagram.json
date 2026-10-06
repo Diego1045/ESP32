@@ -1,0 +1,24 @@
+{
+  "version": 1,
+  "author": "Antigravity",
+  "editor": "wokwi",
+  "parts": [
+    { "type": "wokwi-esp32-devkit-v1", "id": "esp", "top": 0, "left": 0, "attrs": {} },
+    { "type": "wokwi-mfrc522", "id": "rfid", "top": -200, "left": 150, "attrs": {} },
+    { "type": "wokwi-relay-module", "id": "relay", "top": 150, "left": 150, "attrs": {} }
+  ],
+  "connections": [
+    [ "esp:GND.1", "rfid:GND", "black", [ "v0" ] ],
+    [ "esp:3V3", "rfid:3.3V", "red", [ "v0" ] ],
+    [ "esp:18", "rfid:SCK", "orange", [ "v0" ] ],
+    [ "esp:19", "rfid:MISO", "yellow", [ "v0" ] ],
+    [ "esp:23", "rfid:MOSI", "green", [ "v0" ] ],
+    [ "esp:5", "rfid:SDA", "blue", [ "v0" ] ],
+    [ "esp:22", "rfid:RST", "gray", [ "v0" ] ],
+    
+    [ "esp:GND.2", "relay:GND", "black", [ "v0" ] ],
+    [ "esp:5V", "relay:VCC", "red", [ "v0" ] ],
+    [ "esp:2", "relay:IN", "purple", [ "v0" ] ]
+  ],
+  "dependencies": {}
+}

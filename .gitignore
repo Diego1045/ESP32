@@ -1,0 +1,27 @@
+# PlatformIO
+.pio/
+.pioenvs/
+.piolibdeps/
+
+# Python virtual environment
+.venv/
+__pycache__/
+*.pyc
+
+# ESP-IDF / IDF build artifacts
+build/
+sdkconfig
+# Keep sdkconfig.defaults (intencional para el proyecto)
+# sdkconfig.esp32dev puede contener info sensible, excluir si se desea
+# sdkconfig.esp32dev
+
+# macOS
+.DS_Store
+*.swp
+
+# IDE
+.vscode/
+.idea/
+
+# Logs
+*.log
