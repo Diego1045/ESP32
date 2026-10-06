@@ -15,6 +15,8 @@
 #define SECURE_HMAC_BLOCK_A 4
 #define SECURE_HMAC_BLOCK_B 5
 
+void security_init(void);
+
 int security_calculate_hmac(const uint8_t *uid, size_t uid_len,
                             const uint8_t *nonce, const uint8_t *master_key,
                             uint8_t *out_hmac);

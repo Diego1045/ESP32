@@ -14,6 +14,16 @@
 
 static const char *TAG = "ACCESS";
 
+#define ACCESS_TASK_STACK 16384
+
+/** Buffers de proceso (una sola tarea access_task; menos pila). */
+static lock_settings_t s_card_settings;
+static uint8_t s_card_hmac[HMAC_SIZE];
+static uint8_t s_expected_hmac[HMAC_SIZE];
+static uint8_t s_new_nonce[NONCE_SIZE];
+static uint8_t s_new_hmac[HMAC_SIZE];
+static uint8_t s_provision_hmac[HMAC_SIZE];
+
 #define ACCESS_QUEUE_LEN 4
 #define ACCESS_MUTEX_MS 8000
 #define MAX_UID_LEN 10
@@ -80,7 +90,7 @@ void access_system_init(access_context_t *ctx, rc522_handle_t scanner, Semaphore
     }
     s_queue = xQueueCreate(ACCESS_QUEUE_LEN, sizeof(access_msg_t));
     configASSERT(s_queue != NULL);
-    xTaskCreate(access_task, "access_task", 6144, NULL, 5, &s_task);
+    xTaskCreate(access_task, "access_task", ACCESS_TASK_STACK, NULL, 5, &s_task);
 }
 
 void access_on_picc_idle(void) {
@@ -271,13 +281,12 @@ static esp_err_t card_write_trailer(const rc522_picc_t *picc) {
 
 static esp_err_t card_provision_hmac(rc522_picc_t *picc, const lock_settings_t *settings,
                                      const rc522_mifare_key_t *key) {
-    uint8_t hmac[HMAC_SIZE];
     int ret = security_calculate_hmac(picc->uid.value, picc->uid.length, settings->current_nonce,
-                                      settings->master_key, hmac);
+                                      settings->master_key, s_provision_hmac);
     if (ret != 0) {
         return ESP_FAIL;
     }
-    return card_op_with_retry(picc, key, true, op_write_hmac, hmac, NULL);
+    return card_op_with_retry(picc, key, true, op_write_hmac, s_provision_hmac, NULL);
 }
 
 static void process_format_mode(rc522_picc_t *picc, const uint8_t *uid, size_t uid_len) {
@@ -321,12 +330,11 @@ static void process_format_mode(rc522_picc_t *picc, const uint8_t *uid, size_t u
         ESP_LOGI(TAG, "Tarjeta ya formateada; reescribiendo HMAC en bloques 4-5");
     }
 
-    lock_settings_t settings;
-    if (storage_load_settings(&settings) != ESP_OK) {
+    if (storage_load_settings(&s_card_settings) != ESP_OK) {
         access_log_append(uid, uid_len, ACCESS_LOG_FORMAT_FAIL);
         return;
     }
-    if (card_provision_hmac(picc, &settings, &secret_key) != ESP_OK) {
+    if (card_provision_hmac(picc, &s_card_settings, &secret_key) != ESP_OK) {
         ESP_LOGE(TAG, "Error escribiendo HMAC inicial");
         access_log_append(uid, uid_len, ACCESS_LOG_FORMAT_FAIL);
         return;
@@ -348,9 +356,8 @@ static void process_production(rc522_picc_t *picc, const uint8_t *uid, size_t ui
     rc522_mifare_key_t secret_key;
     secret_key_fill(&secret_key);
 
-    uint8_t card_hmac[HMAC_SIZE];
     bool auth_ok = false;
-    if (card_op_with_retry(picc, &secret_key, false, op_read_hmac, card_hmac, &auth_ok) != ESP_OK) {
+    if (card_op_with_retry(picc, &secret_key, false, op_read_hmac, s_card_hmac, &auth_ok) != ESP_OK) {
         if (!auth_ok) {
             announce_denied(uid, uid_len, "DENEGADO: auth MIFARE (use 'format on' si es tarjeta nueva)");
             ESP_LOGE(TAG, "DENEGADO: auth MIFARE (tarjeta sin formatear? use 'format on')");
@@ -362,50 +369,47 @@ static void process_production(rc522_picc_t *picc, const uint8_t *uid, size_t ui
         return;
     }
 
-    console_notify("lectura bloques 4-5 OK (HMAC %02X%02X%02X%02X...)", card_hmac[0], card_hmac[1],
-                   card_hmac[2], card_hmac[3]);
-
-    if (security_hmac_is_unprovisioned(card_hmac)) {
+    if (security_hmac_is_unprovisioned(s_card_hmac)) {
         announce_denied(uid, uid_len, "DENEGADO: HMAC vacio — 'format on'");
         ESP_LOGW(TAG, "DENEGADO: tarjeta sin HMAC; use 'format on' y pase la tarjeta");
         access_log_append(uid, uid_len, ACCESS_LOG_DENIED_UNPROVISIONED);
         return;
     }
 
-    lock_settings_t settings;
-    if (storage_load_settings(&settings) != ESP_OK) {
+    if (storage_load_settings(&s_card_settings) != ESP_OK) {
         access_log_append(uid, uid_len, ACCESS_LOG_DENIED_HMAC);
         return;
     }
 
-    uint8_t expected[HMAC_SIZE];
-    if (security_calculate_hmac(uid, uid_len, settings.current_nonce, settings.master_key, expected) != 0) {
+    if (security_calculate_hmac(uid, uid_len, s_card_settings.current_nonce, s_card_settings.master_key,
+                                s_expected_hmac) != 0) {
         access_log_append(uid, uid_len, ACCESS_LOG_DENIED_HMAC);
         return;
     }
 
-    if (!security_verify_hmac(expected, card_hmac)) {
+    if (!security_verify_hmac(s_expected_hmac, s_card_hmac)) {
         announce_denied(uid, uid_len, "DENEGADO: HMAC no coincide");
         ESP_LOGW(TAG, "DENEGADO: HMAC invalido (replay o tarjeta desincronizada)");
         access_log_append(uid, uid_len, ACCESS_LOG_DENIED_HMAC);
         return;
     }
 
-    uint8_t new_nonce[NONCE_SIZE];
-    uint8_t new_hmac[HMAC_SIZE];
-    if (security_generate_next_session(uid, uid_len, &settings, new_nonce, new_hmac) != 0) {
+    console_notify("HMAC valido (%02X%02X%02X%02X...)", s_card_hmac[0], s_card_hmac[1], s_card_hmac[2],
+                   s_card_hmac[3]);
+
+    if (security_generate_next_session(uid, uid_len, &s_card_settings, s_new_nonce, s_new_hmac) != 0) {
         access_log_append(uid, uid_len, ACCESS_LOG_DENIED_HMAC);
         return;
     }
 
     // Orden: primero la tarjeta, luego NVS. Si falla la tarjeta, nada cambia.
-    if (card_op_with_retry(picc, &secret_key, true, op_write_hmac, new_hmac, NULL) != ESP_OK) {
+    if (card_op_with_retry(picc, &secret_key, true, op_write_hmac, s_new_hmac, NULL) != ESP_OK) {
         ESP_LOGE(TAG, "No se pudo escribir el nuevo HMAC; nonce NVS sin cambiar");
         access_log_append(uid, uid_len, ACCESS_LOG_DENIED_HMAC);
         return;
     }
 
-    if (storage_update_nonce(new_nonce) != ESP_OK) {
+    if (storage_update_nonce(s_new_nonce) != ESP_OK) {
         ESP_LOGE(TAG, "HMAC en tarjeta actualizado pero NVS fallo: re-formatee la tarjeta");
         access_log_append(uid, uid_len, ACCESS_LOG_DENIED_HMAC);
         return;

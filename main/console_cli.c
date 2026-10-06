@@ -3,6 +3,7 @@
 #include "access_log.h"
 #include "actuator.h"
 #include "hardware_profile.h"
+#include "rc522_diag.h"
 #include "rc522_pcd.h"
 #include "rc522_pcd_internal.h"
 #include "rc522_picc_internal.h"

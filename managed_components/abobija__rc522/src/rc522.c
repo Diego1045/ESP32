@@ -17,20 +17,6 @@ RC522_LOG_DEFINE_BASE();
 
 ESP_EVENT_DEFINE_BASE(RC522_EVENTS);
 
-static rc522_diag_t s_diag;
-
-void rc522_diag_get(rc522_diag_t *out)
-{
-    if (out != NULL) {
-        *out = s_diag;
-    }
-}
-
-void rc522_diag_reset(void)
-{
-    memset(&s_diag, 0, sizeof(s_diag));
-}
-
 inline static bool rc522_is_able_to_start(const rc522_handle_t rc522)
 {
     return rc522->state >= RC522_STATE_CREATED && rc522->state != RC522_STATE_POLLING;
@@ -97,20 +83,7 @@ esp_err_t rc522_start(rc522_handle_t rc522)
     }
 
     RC522_RETURN_ON_ERROR(rc522_pcd_reset(rc522, 150));
-    rc522_delay_ms(50);
-
-    rc522_pcd_firmware_t fw = 0;
-    if (rc522_pcd_firmware(rc522, &fw) != ESP_OK || fw == 0x00 || fw == 0xFF) {
-        RC522_LOGE("SPI sin respuesta (version=0x%02X). Revise MOSI/MISO/CS/SCK y 3.3V", (unsigned)fw);
-        return ESP_FAIL;
-    }
-    ESP_LOGI(TAG, "RC522 detectado (version=0x%02X %s)", (unsigned)fw, rc522_pcd_firmware_name(fw));
-
-    esp_err_t rw = rc522_pcd_rw_test(rc522);
-    if (rw != ESP_OK) {
-        RC522_LOGW("prueba FIFO fallo (%s); se continua — si RFID falla, intercambie MOSI y MISO", esp_err_to_name(rw));
-    }
-
+    ESP_RETURN_ON_ERROR(rc522_pcd_rw_test(rc522), TAG, "rw test failed");
     ESP_RETURN_ON_ERROR(rc522_pcd_init(rc522), TAG, "unable to init pcd");
 
     rc522->state = RC522_STATE_POLLING;
@@ -277,36 +250,12 @@ void rc522_task(void *arg)
         if (rc522->picc.state == RC522_PICC_STATE_IDLE || rc522->picc.state == RC522_PICC_STATE_HALT) {
             rc522_picc_atqa_desc_t atqa;
 
-            if (rc522->picc.state == RC522_PICC_STATE_IDLE) {
-                ret = rc522_picc_reqa(rc522, &atqa);
-                s_diag.poll_total++;
-                if (ret != ESP_OK) {
-                    if (ret == RC522_ERR_RX_TIMER_TIMEOUT || ret == RC522_ERR_RX_TIMEOUT) {
-                        s_diag.poll_timeout++;
-                    } else if (ret == RC522_ERR_COLLISION) {
-                        s_diag.poll_collision++;
-                    } else {
-                        s_diag.poll_other++;
-                    }
-                    s_diag.last_poll_err = (uint16_t)ret;
-                    continue;
-                }
-                s_diag.poll_ok++;
+            if (rc522->picc.state == RC522_PICC_STATE_IDLE && ((ret = rc522_picc_reqa(rc522, &atqa)) != ESP_OK)) {
+                continue;
             }
 
-            if (rc522->picc.state == RC522_PICC_STATE_HALT) {
-                ret = rc522_picc_wupa(rc522, &atqa);
-                if (ret != ESP_OK) {
-                    s_diag.poll_total++;
-                    if (ret == RC522_ERR_RX_TIMER_TIMEOUT || ret == RC522_ERR_RX_TIMEOUT) {
-                        s_diag.poll_timeout++;
-                    } else {
-                        s_diag.poll_other++;
-                    }
-                    s_diag.last_poll_err = (uint16_t)ret;
-                    continue;
-                }
-                s_diag.poll_ok++;
+            if (rc522->picc.state == RC522_PICC_STATE_HALT && ((ret = rc522_picc_wupa(rc522, &atqa)) != ESP_OK)) {
+                continue;
             }
 
             // card is present
@@ -329,9 +278,6 @@ void rc522_task(void *arg)
             last_poll_ms = rc522_millis();
 
             if (ret != ESP_OK) {
-                s_diag.select_fail++;
-                s_diag.last_select_err = (uint16_t)ret;
-
                 if (ret != RC522_ERR_RX_TIMEOUT && ret != RC522_ERR_INVALID_ATQA && ret != RC522_ERR_INVALID_SAK) {
                     RC522_LOGW("select failed (err=%04" RC522_X ")", ret);
                 }
@@ -342,8 +288,6 @@ void rc522_task(void *arg)
                 rc522_picc_set_state(rc522, &rc522->picc, RC522_PICC_STATE_IDLE, true);
                 continue;
             }
-
-            s_diag.select_ok++;
 
             memcpy(&rc522->picc.uid, &uid, sizeof(rc522_picc_uid_t));
             rc522->picc.sak = sak;

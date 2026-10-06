@@ -14,8 +14,10 @@
 #include "driver/rc522_spi.h"
 #include "hardware_profile.h"
 #include "rc522.h"
+#include "rc522_diag.h"
 #include "rc522_pcd.h"
 #include "rc522_picc.h"
+#include "security.h"
 #include "storage.h"
 
 static const char *TAG = "MAIN";
@@ -158,6 +160,7 @@ void app_main(void) {
   esp_log_level_set("rc522", ESP_LOG_WARN);
 
   ESP_ERROR_CHECK(storage_init());
+  security_init();
   ESP_ERROR_CHECK(storage_ensure_secrets());
   ESP_ERROR_CHECK(access_log_init());
   access_log_dump_recent(5);
