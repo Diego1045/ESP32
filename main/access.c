@@ -1,5 +1,6 @@
 #include "access.h"
 #include "access_log.h"
+#include "actuator.h"
 #include "console_cli.h"
 #include "picc/rc522_mifare.h"
 #include "rc522_picc_internal.h"
@@ -18,6 +19,35 @@ static const char *TAG = "ACCESS";
 #define MAX_UID_LEN 10
 #define RESELECT_TRIES 3
 #define CARD_OP_TRIES 3
+#define ACCESS_REPEAT_MS 5000
+
+static uint8_t s_cool_uid[MAX_UID_LEN];
+static size_t s_cool_len;
+static TickType_t s_cool_until;
+
+static bool access_repeat_suppressed(const uint8_t *uid, size_t uid_len) {
+    if (uid == NULL || s_cool_len != uid_len || uid_len > MAX_UID_LEN) {
+        return false;
+    }
+    if (memcmp(s_cool_uid, uid, uid_len) != 0) {
+        return false;
+    }
+    return xTaskGetTickCount() < s_cool_until;
+}
+
+static void access_arm_repeat(const uint8_t *uid, size_t uid_len) {
+    if (uid_len > MAX_UID_LEN) {
+        uid_len = MAX_UID_LEN;
+    }
+    memcpy(s_cool_uid, uid, uid_len);
+    s_cool_len = uid_len;
+    s_cool_until = xTaskGetTickCount() + pdMS_TO_TICKS(ACCESS_REPEAT_MS);
+}
+
+static void announce_denied(const uint8_t *uid, size_t uid_len, const char *msg) {
+    access_arm_repeat(uid, uid_len);
+    actuator_show_denied(msg);
+}
 
 typedef enum {
     ACCESS_MSG_PROCESS = 0,
@@ -55,7 +85,6 @@ void access_system_init(access_context_t *ctx, rc522_handle_t scanner, Semaphore
 
 void access_on_picc_idle(void) {
     if (s_last_uid_valid) {
-        console_notify("tarjeta retirada — listo para otra lectura");
         ESP_LOGI(TAG, "Tarjeta retirada; lector listo para la siguiente");
     }
     s_last_uid_valid = false;
@@ -68,6 +97,9 @@ void access_forget_last_uid(void) {
 }
 
 bool access_should_ignore_uid(const uint8_t *uid, size_t uid_len) {
+    if (access_repeat_suppressed(uid, uid_len)) {
+        return true;
+    }
     return s_last_uid_valid && s_last_uid_len == uid_len && memcmp(s_last_uid, uid, uid_len) == 0;
 }
 
@@ -307,7 +339,7 @@ static void process_format_mode(rc522_picc_t *picc, const uint8_t *uid, size_t u
 
 static void process_production(rc522_picc_t *picc, const uint8_t *uid, size_t uid_len) {
     if (storage_is_uid_revoked(uid, uid_len)) {
-        console_notify("DENEGADO: UID revocado");
+        announce_denied(uid, uid_len, "DENEGADO: UID revocado");
         ESP_LOGW(TAG, "DENEGADO: UID revocado");
         access_log_append(uid, uid_len, ACCESS_LOG_DENIED_REVOKED);
         return;
@@ -320,10 +352,10 @@ static void process_production(rc522_picc_t *picc, const uint8_t *uid, size_t ui
     bool auth_ok = false;
     if (card_op_with_retry(picc, &secret_key, false, op_read_hmac, card_hmac, &auth_ok) != ESP_OK) {
         if (!auth_ok) {
-            console_notify("DENEGADO: auth MIFARE (use 'format on' si es tarjeta nueva)");
+            announce_denied(uid, uid_len, "DENEGADO: auth MIFARE (use 'format on' si es tarjeta nueva)");
             ESP_LOGE(TAG, "DENEGADO: auth MIFARE (tarjeta sin formatear? use 'format on')");
         } else {
-            console_notify("DENEGADO: fallo lectura HMAC (centre la tarjeta en la antena)");
+            announce_denied(uid, uid_len, "DENEGADO: fallo lectura HMAC (centre la tarjeta)");
             ESP_LOGE(TAG, "DENEGADO: no se pudo leer HMAC (RF inestable: centre la tarjeta)");
         }
         access_log_append(uid, uid_len, ACCESS_LOG_DENIED_MIFARE);
@@ -334,7 +366,7 @@ static void process_production(rc522_picc_t *picc, const uint8_t *uid, size_t ui
                    card_hmac[2], card_hmac[3]);
 
     if (security_hmac_is_unprovisioned(card_hmac)) {
-        console_notify("DENEGADO: HMAC vacio — 'format on'");
+        announce_denied(uid, uid_len, "DENEGADO: HMAC vacio — 'format on'");
         ESP_LOGW(TAG, "DENEGADO: tarjeta sin HMAC; use 'format on' y pase la tarjeta");
         access_log_append(uid, uid_len, ACCESS_LOG_DENIED_UNPROVISIONED);
         return;
@@ -353,7 +385,7 @@ static void process_production(rc522_picc_t *picc, const uint8_t *uid, size_t ui
     }
 
     if (!security_verify_hmac(expected, card_hmac)) {
-        console_notify("DENEGADO: HMAC no coincide (re-formatee o tarjeta de otro sistema)");
+        announce_denied(uid, uid_len, "DENEGADO: HMAC no coincide");
         ESP_LOGW(TAG, "DENEGADO: HMAC invalido (replay o tarjeta desincronizada)");
         access_log_append(uid, uid_len, ACCESS_LOG_DENIED_HMAC);
         return;
@@ -379,12 +411,12 @@ static void process_production(rc522_picc_t *picc, const uint8_t *uid, size_t ui
         return;
     }
 
-    console_notify("ACCESO CONCEDIDO — UID valido, sesion actualizada");
-    ESP_LOGI(TAG, "ACCESO CONCEDIDO");
-    access_log_append(uid, uid_len, ACCESS_LOG_GRANTED);
+    access_arm_repeat(uid, uid_len);
     if (s_grant_fn != NULL) {
         s_grant_fn();
     }
+    ESP_LOGI(TAG, "ACCESO CONCEDIDO");
+    access_log_append(uid, uid_len, ACCESS_LOG_GRANTED);
 }
 
 static void process_card(rc522_picc_t *picc) {
@@ -396,15 +428,18 @@ static void process_card(rc522_picc_t *picc) {
     uint8_t uid[MAX_UID_LEN];
     memcpy(uid, picc->uid.value, uid_len);
 
+    if (access_repeat_suppressed(uid, uid_len)) {
+        end_picc_session(picc);
+        return;
+    }
+
     char uid_str[RC522_PICC_UID_STR_BUFFER_SIZE_MAX] = {0};
     rc522_picc_uid_to_str(&picc->uid, uid_str, sizeof(uid_str));
     ESP_LOGI(TAG, "Procesando UID=%s tipo=%d (formateo=%s)", uid_str, picc->type,
              storage_get_format_mode() ? "ON" : "OFF");
-    console_notify("procesando UID=%s (formateo %s)", uid_str,
-                   storage_get_format_mode() ? "ON" : "OFF");
 
     if (!rc522_mifare_type_is_classic_compatible(picc->type)) {
-        console_notify("DENEGADO: no es MIFARE Classic");
+        announce_denied(uid, uid_len, "DENEGADO: no es MIFARE Classic");
         ESP_LOGW(TAG, "DENEGADO: tipo de tarjeta no es MIFARE Classic");
         access_log_append(uid, uid_len, ACCESS_LOG_DENIED_TYPE);
         end_picc_session(picc);

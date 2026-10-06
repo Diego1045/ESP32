@@ -4,21 +4,29 @@
 #include "freertos/timers.h"
 #include "hardware_profile.h"
 #include <stdio.h>
+#include <string.h>
 
 static const char *TAG = "ACTUATOR";
 static TimerHandle_t s_relay_timer;
 
 #define RELAY_ON_TIME_MS 2000
 
+static void door_event(const char *kind, const char *extra) {
+    if (extra != NULL && extra[0] != '\0') {
+        printf("@@DOOR@@ %s|%.48s\n", kind, extra);
+    } else {
+        printf("@@DOOR@@ %s\n", kind);
+    }
+    fflush(stdout);
+}
+
 static void relay_off_timer_cb(TimerHandle_t t) {
     (void)t;
 #if HW_HAS_RELAY
     gpio_set_level(RELAY_GPIO, 0);
     ESP_LOGI(TAG, "Relé OFF");
-#else
-    printf("\n*** [SIM] RELÉ OFF ***\n");
-    fflush(stdout);
 #endif
+    door_event("CLOSE", NULL);
 }
 
 void actuator_init(void) {
@@ -44,12 +52,27 @@ void actuator_grant_access(void) {
     }
     ESP_LOGI(TAG, "Relé ON (%d ms)", RELAY_ON_TIME_MS);
 #else
-    printf("\n*** [SIM] RELÉ ON %d ms — ACCESO CONCEDIDO ***\n", RELAY_ON_TIME_MS);
-    fflush(stdout);
     if (s_relay_timer != NULL) {
         xTimerReset(s_relay_timer, 0);
     }
 #endif
+    door_event("OPEN", NULL);
+}
+
+void actuator_show_denied(const char *reason) {
+    char clean[49];
+    size_t n = 0;
+    if (reason != NULL) {
+        for (size_t i = 0; reason[i] != '\0' && n < sizeof(clean) - 1; i++) {
+            char c = reason[i];
+            if (c == '\n' || c == '\r' || c == '|') {
+                c = ' ';
+            }
+            clean[n++] = c;
+        }
+    }
+    clean[n] = '\0';
+    door_event("DENY", clean);
 }
 
 void bench_console_unlock(void) {

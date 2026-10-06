@@ -115,9 +115,15 @@ static void rc522_handler(void *arg, esp_event_base_t base, int32_t event_id,
   if (picc->state == RC522_PICC_STATE_IDLE) {
     if (event->old_state == RC522_PICC_STATE_READY ||
         event->old_state == RC522_PICC_STATE_READY_H) {
-      rc522_diag_t d;
-      rc522_diag_get(&d);
-      console_notify("SELECT fallo (0x%04X) — tarjeta quieta; pruebe gain 33", (unsigned)d.last_select_err);
+      static TickType_t s_last_select_note;
+      const TickType_t now = xTaskGetTickCount();
+      if ((now - s_last_select_note) >= pdMS_TO_TICKS(5000)) {
+        s_last_select_note = now;
+        rc522_diag_t d;
+        rc522_diag_get(&d);
+        console_notify("SELECT fallo (0x%04X) — tarjeta quieta; pruebe gain 33",
+                       (unsigned)d.last_select_err);
+      }
     } else if (event->old_state == RC522_PICC_STATE_ACTIVE ||
                event->old_state == RC522_PICC_STATE_ACTIVE_H) {
       console_notify("estado %s -> IDLE", picc_state_name(event->old_state));
@@ -136,18 +142,13 @@ static void rc522_handler(void *arg, esp_event_base_t base, int32_t event_id,
     return;
   }
 
-  char uid_str[RC522_PICC_UID_STR_BUFFER_SIZE_MAX] = {0};
-  rc522_picc_uid_to_str(&picc->uid, uid_str, sizeof(uid_str));
-  const char *tipo = rc522_picc_type_name(picc->type);
-  console_notify("lectura UID=%s SAK=0x%02X ATQA=0x%04X tipo=%s", uid_str, picc->sak,
-                 (unsigned)picc->atqa.source, tipo != NULL ? tipo : "?");
-
   if (access_should_ignore_uid(picc->uid.value, picc->uid.length)) {
-    console_notify("UID %s ya procesado — retire la tarjeta o 'format on/off'", uid_str);
     access_submit_halt_only(picc);
     return;
   }
 
+  char uid_str[RC522_PICC_UID_STR_BUFFER_SIZE_MAX] = {0};
+  rc522_picc_uid_to_str(&picc->uid, uid_str, sizeof(uid_str));
   ESP_LOGI(TAG, "Tarjeta detectada: UID=%s", uid_str);
   access_submit_card(picc);
 }
