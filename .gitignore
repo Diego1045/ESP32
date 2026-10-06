@@ -12,7 +12,7 @@ __pycache__/
 build/
 sdkconfig
 # Keep sdkconfig.defaults (intencional para el proyecto)
-# sdkconfig.esp32dev puede contener info sensible, excluir si se desea
+# lsdkconfig.esp32dev puede contener info sensible, excluir si se desea
 # sdkconfig.esp32dev
 
 # macOS
