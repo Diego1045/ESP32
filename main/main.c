@@ -13,25 +13,24 @@
 #include "rc522_picc.h"
 #include "security.h"
 #include "storage.h"
-// Acceso a la funcion interna halta() para resetear la tarjeta tras cada operacion
+// Acceso a la funcion interna halta() para resetear la tarjeta tras cada
+// operacion
 #include "rc522_picc_internal.h"
 
 static const char *TAG = "MAIN";
 
 #define RELAY_GPIO 2
-#define PIN_NUM_MISO 26 // D26 - movido de D12 (strapping pin)
-#define PIN_NUM_MOSI 13
-#define PIN_NUM_CLK 14
-#define PIN_NUM_CS 27  // D27 - lado derecho del ESP32, junto a D12/13/14
-#define PIN_NUM_RST -1 // VN/GPIO39 es solo entrada; usamos soft-reset
+// Pines SPI para RC522 - cableado físico real (lado izquierdo + GPIO14)
+// Bus HSPI (SPI2_HOST): pines nativos GPIO14(CLK), GPIO12(MISO), GPIO13(MOSI)
+// Usamos GPIO26 como MISO en lugar del 12 (via GPIO Matrix del ESP32)
+#define PIN_NUM_MISO 26 // D26 -> MISO del RC522
+#define PIN_NUM_MOSI 13 // D13 -> MOSI del RC522
+#define PIN_NUM_CLK  14 // D14 -> SCK  del RC522 (pin nativo HSPI)
+#define PIN_NUM_CS   27 // D27 -> SDA/CS del RC522
+#define PIN_NUM_RST  -1 // RST no conectado - usa soft-reset interno
 
 static rc522_handle_t scanner;
 static lock_settings_t settings;
-
-// Variables para control de intentos y tiempos
-static TickType_t last_scan_time = 0;
-static int failed_attempts = 0;
-static TickType_t block_until = 0;
 
 // CAMBIA ESTO A false DESPUES DE HABER FORMATEADO TUS TARJETAS
 static bool format_mode = false;
@@ -42,23 +41,10 @@ static void rc522_handler(void *arg, esp_event_base_t base, int32_t event_id,
       (rc522_picc_state_changed_event_t *)event_data;
   rc522_picc_t *picc = event->picc;
 
-  if (picc->state == RC522_PICC_STATE_ACTIVE) {
-    TickType_t now = xTaskGetTickCount();
+  if (picc->state == RC522_PICC_STATE_ACTIVE ||
+      picc->state == RC522_PICC_STATE_ACTIVE_H) {
 
-    // Verificar si estamos bloqueados por 2 minutos
-    if (block_until != 0 && now < block_until) {
-      ESP_LOGW(TAG, "SISTEMA BLOQUEADO. Intento ignorado. Faltan %d segundos.",
-               (block_until - now) * portTICK_PERIOD_MS / 1000);
-      return;
-    }
-
-    // Cooldown de 1.5 segundos entre CADA lectura
-    if (now - last_scan_time < pdMS_TO_TICKS(1500)) {
-      return; // Ignorar si fue muy rápido
-    }
-    last_scan_time = now;
-
-    ESP_LOGI(TAG, "Tarjeta detectada UID!");
+    ESP_LOGI(TAG, "¡Tarjeta detectada! (Estado: %d)", picc->state);
 
 // Soporte para UIDs de hasta 10 bytes (el maximo estandar ISO 14443A)
 #define MAX_UID_LEN 10
@@ -71,7 +57,7 @@ static void rc522_handler(void *arg, esp_event_base_t base, int32_t event_id,
     }
 
     // -----------------------------------------------------------
-    // LÓGICA DE AUTENTICACIÓN MIFARE (CRYPTO-1)
+    // LÓGICA DE AUTENTICACIÓN MIFARE (CRYPTO-1) - ACTIVA
     // -----------------------------------------------------------
     if (rc522_mifare_type_is_classic_compatible(picc->type)) {
       rc522_mifare_key_t secret_key = {.type = RC522_MIFARE_KEY_A,
@@ -109,8 +95,9 @@ static void rc522_handler(void *arg, esp_event_base_t base, int32_t event_id,
                         "formateada, o es otra clave.");
         }
         rc522_mifare_deauth(scanner, picc); // Detener crypto en el lector (PCD)
-        rc522_picc_halta(scanner, picc);    // Enviar HALT a la tarjeta (PICC) - CRITICO
-        return; // En modo formateo no abrimos la puerta
+        rc522_picc_halta(scanner,
+                         picc); // Enviar HALT a la tarjeta (PICC) - CRITICO
+        return;                 // En modo formateo no abrimos la puerta
       } else {
         // MODO SEGURO (PRODUCCIÓN)
         ESP_LOGI(TAG, "Intentando abrir Sector con clave secreta...");
@@ -119,7 +106,8 @@ static void rc522_handler(void *arg, esp_event_base_t base, int32_t event_id,
           // La autenticacion con la clave secreta es suficiente prueba.
           // El simple hecho de que la tarjeta conozca la clave de 281 billones
           // de combinaciones DEMUESTRA que no es un clon de UID.
-          ESP_LOGI(TAG, "Autenticacion de Sector: OK. Clave secreta verificada.");
+          ESP_LOGI(TAG,
+                   "Autenticacion de Sector: OK. Clave secreta verificada.");
 
           uint8_t received_hash[HMAC_SIZE];
           security_calculate_hmac(uid, uid_len, settings.current_nonce,
@@ -128,8 +116,6 @@ static void rc522_handler(void *arg, esp_event_base_t base, int32_t event_id,
           if (security_validate_and_update_card(uid, uid_len, received_hash,
                                                 &settings) == 0) {
             ESP_LOGI(TAG, "ACCESO CONCEDIDO");
-            failed_attempts = 0;
-            block_until = 0;
 
             gpio_set_level(RELAY_GPIO, 1);
             vTaskDelay(pdMS_TO_TICKS(2000));
@@ -137,39 +123,23 @@ static void rc522_handler(void *arg, esp_event_base_t base, int32_t event_id,
             storage_load_settings(&settings);
           }
         } else {
-          failed_attempts++;
-          ESP_LOGE(TAG,
-                   "ACCESO DENEGADO (Clave incorrecta / Posible Clon). Intento "
-                   "%d de 5",
-                   failed_attempts);
-          if (failed_attempts >= 5) {
-            ESP_LOGE(
-                TAG,
-                "¡5 INTENTOS FALLIDOS! Bloqueando sistema por 2 minutos...");
-            block_until = now + pdMS_TO_TICKS(120000);
-          }
-          // Forzar cooldown extra tras fallo de auth para que el RC522 se
-          // recupere del estado criptografico. Sin esto, la tarjeta queda
-          // "trabada".
-          last_scan_time = xTaskGetTickCount() + pdMS_TO_TICKS(2000);
+          ESP_LOGE(TAG, "ACCESO DENEGADO (Clave incorrecta / Posible Clon).");
         }
         rc522_mifare_deauth(scanner, picc); // Detener crypto en el lector (PCD)
-        rc522_picc_halta(scanner, picc);    // Enviar HALT a la tarjeta (PICC) - CRITICO
+        rc522_picc_halta(scanner,
+                         picc); // Enviar HALT a la tarjeta (PICC) - CRITICO
       }
-      // Cooldown adicional post-operacion MIFARE
-      last_scan_time = xTaskGetTickCount() + pdMS_TO_TICKS(500);
     } else {
       ESP_LOGW(TAG,
                "La tarjeta no es compatible con seguridad MIFARE Classic.");
+      rc522_picc_halta(scanner, picc);
     }
   }
 }
 
 void app_main(void) {
   ESP_LOGI(TAG, "Iniciando Cerradura de Alta Seguridad...");
-
-  // Mostrar logs de advertencias y errores de la libreria rc522
-  esp_log_level_set("rc522", ESP_LOG_WARN);
+  esp_log_level_set("rc522", ESP_LOG_INFO);
 
   // 1. Inicializar Almacenamiento
   ESP_ERROR_CHECK(storage_init());
@@ -181,16 +151,21 @@ void app_main(void) {
   gpio_set_level(RELAY_GPIO, 0);
 
   // 3. Configurar e Inicializar RC522 (Lector RFID real)
+  // SPI2_HOST = HSPI: pines nativos GPIO14(CLK), GPIO13(MOSI)
+  // MISO va a GPIO26 via GPIO Matrix (el ESP32 permite remapear cualquier GPIO)
   rc522_spi_config_t spi_config = {.host_id = SPI2_HOST,
                                    .bus_config =
                                        &(spi_bus_config_t){
                                            .miso_io_num = PIN_NUM_MISO,
                                            .mosi_io_num = PIN_NUM_MOSI,
                                            .sclk_io_num = PIN_NUM_CLK,
+                                           .max_transfer_sz = 64,
                                        },
                                    .dev_config =
                                        {
                                            .spics_io_num = PIN_NUM_CS,
+                                           .clock_speed_hz = 1000000, // 1 MHz para mayor estabilidad
+                                           .mode = 0,
                                        },
                                    .rst_io_num = PIN_NUM_RST};
 
